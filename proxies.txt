@@ -1,0 +1,4 @@
+# Внесите ваши прокси по одному на строку в форматах:
+# http://username:password@ip:port
+# socks5://username:password@ip:port
+# http://ip:port
