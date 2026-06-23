@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 import re
+import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -20,8 +21,26 @@ from typing import Optional
 import httpx
 
 SCRIPT_DIR = Path(__file__).parent
+LOCK_FILE = SCRIPT_DIR / "shopper.lock"
 KYIV_TZ = timezone(timedelta(hours=3))
 SCHEDULE_HOURS = [9, 13, 18]
+
+
+def acquire_lock():
+    """Prevent multiple instances from running."""
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text().strip())
+            os.kill(pid, 0)
+            print(f"Another instance running (PID {pid}). Exiting.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass
+    LOCK_FILE.write_text(str(os.getpid()))
+
+
+def release_lock():
+    LOCK_FILE.unlink(missing_ok=True)
 
 # ====================================================================
 # ZAKAZ.UA API (REAL REST — быстрее Playwright в 10 раз)
@@ -348,8 +367,14 @@ async def run_once(test: bool = False):
 
 
 if __name__ == "__main__":
+    import atexit
     if "--loop" in sys.argv:
-        asyncio.run(main_loop())
+        acquire_lock()
+        atexit.register(release_lock)
+        try:
+            asyncio.run(main_loop())
+        finally:
+            release_lock()
     elif "--test" in sys.argv:
         asyncio.run(run_once(test=True))
     else:
