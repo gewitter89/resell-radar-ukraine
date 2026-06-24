@@ -183,9 +183,15 @@ def np_delivery_prices(weight_kg: float = 2.0, floor: int = 1) -> list[dict]:
 
 def load_config() -> dict:
     path = SCRIPT_DIR / "shopping_list.json"
+    cfg = {}
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    # env vars override file values (for CI/GitHub Actions)
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        cfg["telegram_bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        cfg["telegram_chat_id"] = int(os.environ["TELEGRAM_CHAT_ID"])
+    return cfg
 
 
 # ====================================================================
