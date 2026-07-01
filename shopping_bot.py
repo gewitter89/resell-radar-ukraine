@@ -38,6 +38,7 @@ from auto_shopper import (
     load_config, KYIV_STORES, ZAKAZ_BASE, zakaz_get,
     run_cycle, send_telegram,
 )
+from delivery_kyiv import calculate_best_delivery, KYIV_STORE_DELIVERY
 
 # ====================================================================
 # CONFIG
@@ -350,24 +351,57 @@ async def fetch_live_price(query: str) -> Optional[dict]:
 @router.message(CommandStart())
 async def cmd_start(msg: Message):
     await msg.answer(
-        "🛒 <b>Shopping Bot</b>\n\n"
-        "Я твой персональный помощник по магазинам.\n"
-        "Ищу лучшие цены в Novus / Auchan / Metro,\n"
-        "веду корзину, показываю историю, делаю меню.\n\n"
+        "🛒 <b>Shopping Bot</b> — персональный помощник по магазинам.\n\n"
+        "Ищу лучшие цены, веду корзину, считаю доставку, делаю меню.\n\n"
         "<b>Команды:</b>\n"
-        "/price <i>продукт</i> — цены сейчас\n"
-        "/promo — топ скидок дня\n"
-        "/add <i>продукт</i> — в корзину\n"
-        "/remove <i>продукт</i> — убрать из корзины\n"
-        "/cart — показать корзину\n"
-        "/order — оформить заказ\n"
-        "/repeat — повторить прошлый заказ\n"
-        "/history <i>продукт</i> — цены за неделю\n"
-        "/menu — эконом-меню дня\n"
-        "/clear — очистить корзину\n"
-        "/list — твой список покупок",
+        "  /price <i>продукт</i> — цены сейчас\n"
+        "  /promo — топ скидок дня\n"
+        "  /add <i>продукт</i> — в корзину\n"
+        "  /remove <i>продукт</i> — убрать из корзины\n"
+        "  /cart — показать корзину\n"
+        "  /delivery — сравнить варианты доставки\n"
+        "  /order — оформить заказ\n"
+        "  /repeat — повторить прошлый заказ\n"
+        "  /alerts — последние уведомления по ценам\n"
+        "  /history <i>продукт</i> — цены за 2 недели\n"
+        "  /menu — эконом-меню дня (Groq AI)\n"
+        "  /clear — очистить корзину\n"
+        "  /list — твой список покупок\n"
+        "  /help — подробная справка",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(msg: Message):
+    await msg.answer(
+        "📚 <b>СПРАВКА</b>\n\n"
+        "<b>🔍 Цены и поиск:</b>\n"
+        "  • <code>/price молоко 1л</code> — цены сейчас во всех магазинах\n"
+        "  • <code>/promo</code> — топ-10 скидок дня (до -56%)\n"
+        "  • Поддерживает RU→UA перевод: «куриные бёдра» → «стегно куряче»\n\n"
+        "<b>🛒 Корзина:</b>\n"
+        "  • <code>/add 2 молоко 1л</code> — добавить 2×молоко\n"
+        "  • <code>/cart</code> — показать корзину с живыми ценами\n"
+        "  • <code>/delivery</code> — сравнить доставку по магазинам\n"
+        "  • <code>/order</code> — оформить с расчётом суммы\n"
+        "  • <code>/repeat</code> — повторить прошлый заказ\n\n"
+        "<b>📊 Аналитика:</b>\n"
+        "  • <code>/history рис 1кг</code> — цены за 14 дней (min/max/trend)\n"
+        "  • <code>/alerts</code> — уведомления о падении цен ≥20%\n"
+        "  • Автоматические алерты каждые 4 часа для товаров в корзине\n"
+        "  • Еженедельный отчёт каждый понедельник 10:00\n\n"
+        "<b>🍽 Меню:</b>\n"
+        "  • <code>/menu 500</code> — эконом-меню на 500₴ в день\n"
+        "  • Groq AI (Llama 3.3 70B) + реальные цены Zakaz.ua\n\n"
+        "<b>🚚 Доставка:</b>\n"
+        "  • Zakaz.ua: 59 ₴ (бесплатно от 1200 ₴)\n"
+        "  • Novus: 59 ₴ (бесплатно от 800 ₴)\n"
+        "  • Silpo: 79 ₴ (бесплатно от 1000 ₴)\n"
+        "  • ATB: только самовывоз\n\n"
+        "<b>📦 Stores:</b> Zakaz.ua → Metro/Auchan/Novus, Silpo, Varus, Maudau, ATB",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -502,6 +536,7 @@ async def show_cart(msg: Message, items: list[tuple[str, float]]):
     lines = ["🛒 <b>ТВОЯ КОРЗИНА</b>\n"]
     total = 0.0
     cart_items = []
+    stores_used = set()
 
     for product, qty in items:
         result = await fetch_live_price(product)
@@ -511,6 +546,7 @@ async def show_cart(msg: Message, items: list[tuple[str, float]]):
         best = result["best"]
         sub = best["price"] * qty
         total += sub
+        stores_used.add(best["store"])
         cart_items.append({"product": product, "qty": qty,
                            "price": best["price"], "store": best["store"],
                            "url": best.get("url", "")})
@@ -519,19 +555,44 @@ async def show_cart(msg: Message, items: list[tuple[str, float]]):
             f"({best['store']}) <a href='{best.get('url', '')}'>→</a>"
         )
 
-    lines.append(f"\n━" * 15)
+    lines.append(f"\n{'━' * 15}")
     lines.append(f"💰 <b>Сумма товаров:</b> {total:.0f} ₴")
-    lines.append(f"🚚 <b>НП Відділення:</b> +70 ₴")
-    lines.append(f"🏠 <b>НП Кур'єр:</b> +95 ₴")
-    lines.append(f"━" * 15)
-    lines.append(f"📦 <b>ИТОГО + доставка:</b> {total + 70:.0f} ₴ / {total + 95:.0f} ₴")
 
-    # Save order snapshot for repeat
+    if stores_used:
+        main_store = next(iter(stores_used))
+        plan = calculate_best_delivery(main_store, total, weight_kg=3.0)
+        store = KYIV_STORE_DELIVERY.get(main_store)
+
+        if store and store.has_courier:
+            if plan.is_free_delivery:
+                lines.append(f"🚚 <b>Доставка:</b> <b>БЕСПЛАТНО</b> (от {store.free_from} ₴)")
+            else:
+                needed = store.free_from - total
+                lines.append(
+                    f"🚚 <b>Доставка:</b> {plan.store_delivery:.0f} ₴ "
+                    f"(бесплатно от {store.free_from} ₴, осталось +{needed:.0f} ₴)"
+                )
+        elif store and store.has_pickup:
+            lines.append(f"🏪 <b>Самовывоз:</b> бесплатно (доставки нет)")
+
+        lines.append(f"{'━' * 15}")
+        if plan.is_free_delivery or (store and not store.has_courier):
+            lines.append(f"📦 <b>ИТОГО:</b> <b>{total:.0f} ₴</b>")
+        else:
+            lines.append(
+                f"📦 <b>ИТОГО + доставка:</b> <b>{total + plan.store_delivery:.0f} ₴</b>"
+            )
+        lines.append(f"💡 {plan.recommendation}")
+    else:
+        lines.append(f"🚚 <b>НП Відділення:</b> ~70₴ | <b>Кур'єр:</b> ~95₴")
+        lines.append(f"{'━' * 15}")
+        lines.append(f"📦 <b>ИТОГО + доставка:</b> {total + 70:.0f} ₴ / {total + 95:.0f} ₴")
+
     if cart_items:
         order_save(cart_items, total)
 
     await msg.answer("\n".join(lines), parse_mode=ParseMode.HTML,
-                      reply_markup=cart_kb(), disable_web_page_preview=True)
+                     reply_markup=cart_kb(), disable_web_page_preview=True)
 
 
 @router.message(Command("clear"))
@@ -619,6 +680,42 @@ async def cmd_alerts(msg: Message):
         text += f"   📅 {a['time'][:16]} · {a['store']}\n\n"
 
     text += f"<i>Всего: {len(alerts)} уведомлений</i>"
+    await msg.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("delivery"))
+async def cmd_delivery(msg: Message):
+    """Compare delivery options for all stores."""
+    items = cart_list()
+    if not items:
+        await msg.answer("🛒 Корзина пуста — нечего доставлять\n\nДобавь: <code>/add молоко 1л</code>",
+                         parse_mode=ParseMode.HTML)
+        return
+
+    total = 0.0
+    for product, qty in items:
+        result = await fetch_live_price(product)
+        if result:
+            total += result["best"]["price"] * qty
+
+    text = "🚚 <b>ВАРИАНТЫ ДОСТАВКИ</b>\n\n"
+    text += f"💰 Сумма заказа: <b>{total:.0f} ₴</b>\n\n"
+
+    for store_name, store in KYIV_STORE_DELIVERY.items():
+        plan = calculate_best_delivery(store_name, total, weight_kg=3.0)
+        free_tag = "✅ <b>БЕСПЛАТНО</b>" if plan.is_free_delivery else f"{plan.store_delivery:.0f} ₴"
+
+        if not store.has_courier:
+            text += f"🏪 <b>{store_name}</b> — {free_tag}\n"
+            text += f"    {store.notes}\n"
+        else:
+            text += f"🚚 <b>{store_name}</b> — {free_tag}\n"
+            if not plan.is_free_delivery:
+                needed = store.free_from - total
+                text += f"    Бесплатно от {store.free_from} ₴ (+{needed:.0f} ₴)\n"
+        text += f"    💵 Итого: <b>{plan.total:.0f} ₴</b>\n\n"
+
+    text += "<i>Nova Poshta — отдельно для междугородней доставки.</i>"
     await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
