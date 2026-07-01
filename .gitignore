@@ -40,3 +40,14 @@ data/export/
 tmp/
 temp/
 scratch/*.pyc
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Bot runtime
+shopping.db
+price_history.db
+shopper.lock
+*.pid
