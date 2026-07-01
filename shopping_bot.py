@@ -151,6 +151,134 @@ def order_last() -> Optional[dict]:
             "count": count, "created": created}
 
 
+def alert_init():
+    """Create price_alerts table if missing."""
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product TEXT NOT NULL,
+                old_price REAL,
+                new_price REAL,
+                percent REAL,
+                store TEXT,
+                notified_at TEXT
+            )
+        """)
+
+
+def alert_save(product: str, old_price: float, new_price: float, store: str):
+    """Save price-drop alert."""
+    percent = ((new_price - old_price) / old_price) * 100
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""
+            INSERT INTO price_alerts (product, old_price, new_price, percent, store, notified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product, old_price, new_price, percent, store,
+              datetime.now(KYIV_TZ).isoformat()))
+
+
+def alert_recent(days: int = 7) -> list[dict]:
+    """Return recent alerts."""
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("""
+            SELECT product, old_price, new_price, percent, store, notified_at
+            FROM price_alerts
+            WHERE notified_at >= datetime('now', ?)
+            ORDER BY notified_at DESC
+        """, (f"-{days} days",)).fetchall()
+    return [{"product": r[0], "old": r[1], "new": r[2],
+             "percent": r[3], "store": r[4], "time": r[5]} for r in rows]
+
+
+async def price_drop_check(bot: Bot, chat_id: int):
+    """Check cart products for price drops >20% from historical max."""
+    items = cart_list()
+    if not items:
+        return
+
+    log.info(f"🔍 PRICE CHECK: {len(items)} products")
+    alerts = []
+
+    for product, qty in items:
+        hist = price_history(product, days=14)
+        if len(hist) < 2:
+            continue
+
+        prices = [p for _, p in hist]
+        max_price = max(prices)
+        current_price = prices[-1]
+        drop_percent = ((current_price - max_price) / max_price) * 100
+
+        if drop_percent <= -20:
+            store = "Zakaz.ua"
+            alert_save(product, max_price, current_price, store)
+            alerts.append({
+                "product": product,
+                "old": max_price,
+                "new": current_price,
+                "drop": drop_percent,
+                "store": store,
+            })
+            log.info(f"📉 PRICE DROP: {product} {max_price:.0f} ₴ → {current_price:.0f} ₴ ({drop_percent:.1f}%)")
+
+    if alerts:
+        text = "🔔 <b>ЦЕНЫ УПАЛИ!</b>\n\n"
+        for a in alerts:
+            text += f"📉 <b>{a['product']}</b>\n"
+            text += f"   Было: <s>{a['old']:.0f} ₴</s>\n"
+            text += f"   Стало: <b>{a['new']:.0f} ₴</b> ({a['drop']:+.1f}%)\n"
+            text += f"   📅 Магазин: {a['store']}\n\n"
+
+        text += "💡 Пора заказывать пока цена низкая!"
+
+        try:
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.error(f"❌ ALERT send failed: {e}")
+
+
+async def weekly_report(bot: Bot, chat_id: int):
+    """Weekly price history report for cart items."""
+    items = cart_list()
+    if not items:
+        await bot.send_message(chat_id,
+                               "📊 Корзина пуста. Добавь товары через /add.")
+        return
+
+    text = "📊 <b>ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ О ЦЕНАХ</b>\n\n"
+    text += f"📅 Период: последние 14 дней\n\n"
+
+    for product, qty in items[:10]:
+        hist = price_history(product, days=14)
+        if not hist:
+            continue
+
+        prices = [p for _, p in hist]
+        min_p, max_p, avg_p = min(prices), max(prices), sum(prices) / len(prices)
+        current = prices[-1]
+        change = ((current - min_p) / min_p) * 100 if min_p > 0 else 0
+
+        trend = "📉" if change <= -10 else "📈" if change >= 10 else "➖"
+        change_str = f"{change:+.1f}%" if change != 0 else "без изменений"
+
+        text += f"<b>{product}</b>\n"
+        text += f"  {trend} Сейчас: <b>{current:.0f} ₴</b> ({change_str})\n"
+        text += f"  Min: {min_p:.0f} ₴ | Max: {max_p:.0f} ₴ | Avg: {avg_p:.0f} ₴\n"
+
+        if len(hist) >= 3:
+            sparkline = " → ".join([f"{p:.0f}" for p in prices[-5:]])
+            text += f"  📈 Тренд: {sparkline}\n"
+        text += "\n"
+
+    text += "<i>Обновления каждые 4 часа. /history <product> для деталей.</i>"
+
+    try:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.error(f"❌ Weekly report failed: {e}")
+
+
 # ====================================================================
 # FSM
 # ====================================================================
@@ -473,6 +601,27 @@ async def cmd_history(msg: Message):
     await msg.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@router.message(Command("alerts"))
+async def cmd_alerts(msg: Message):
+    """Show recent price-drop alerts."""
+    alerts = alert_recent(days=7)
+    if not alerts:
+        await msg.answer(
+            "🔔 Нет уведомлений за последние 7 дней.\n\n"
+            "Добавь товары в корзину через /add — получишь алерты когда цены упадут на ≥20%.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    text = f"🔔 <b>ПОСЛЕДНИЕ ПАДЕНИЯ ЦЕН</b> (7 дней)\n\n"
+    for a in alerts[:10]:
+        text += f"📉 <b>{a['product']}</b>\n"
+        text += f"   <s>{a['old']:.0f} ₴</s> → <b>{a['new']:.0f} ₴</b> ({a['percent']:+.1f}%)\n"
+        text += f"   📅 {a['time'][:16]} · {a['store']}\n\n"
+
+    text += f"<i>Всего: {len(alerts)} уведомлений</i>"
+    await msg.answer(text, parse_mode=ParseMode.HTML)
+
+
 @router.message(Command("menu"))
 async def cmd_menu(msg: Message):
     """Economy menu for today — Groq AI powered. Usage: /menu [budget]"""
@@ -733,10 +882,13 @@ async def cron_worker(bot: Bot):
     log.info(f"⏰ CRON: will run at {schedule}:00")
 
     last_hour = None
+    last_price_check = None
+    last_weekly = None
     while True:
         now = datetime.now(KYIV_TZ)
         h = now.hour
         m = now.minute
+
         if h in schedule and h != last_hour and m < 2:
             last_hour = h
             log.info(f"🚀 CRON: running schedule {h}:00")
@@ -750,6 +902,26 @@ async def cron_worker(bot: Bot):
                 log.error(f"❌ CRON failed: {e}")
         elif h not in schedule:
             last_hour = None
+
+        # Price drop check every 4 hours
+        if last_price_check is None or (now - last_price_check).total_seconds() > 4 * 3600:
+            try:
+                await price_drop_check(bot, chat_id)
+                last_price_check = now
+            except Exception as e:
+                log.error(f"❌ Price check failed: {e}")
+
+        # Weekly report on Monday at 10:00
+        if now.weekday() == 0 and h == 10 and m < 2 and last_weekly is None:
+            try:
+                await weekly_report(bot, chat_id)
+                last_weekly = now
+                log.info("📊 Weekly report sent")
+            except Exception as e:
+                log.error(f"❌ Weekly report failed: {e}")
+        elif now.weekday() != 0:
+            last_weekly = None
+
         await asyncio.sleep(60)
 
 
@@ -767,6 +939,7 @@ async def main():
                         format="%(asctime)s [%(name)s] %(message)s")
 
     db_init()
+    alert_init()
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())

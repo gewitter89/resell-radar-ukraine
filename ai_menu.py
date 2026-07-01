@@ -4,6 +4,9 @@ Uses Zakaz.ua real prices to build realistic menu.
 """
 import os
 import httpx
+from dotenv import load_dotenv
+load_dotenv()
+
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
