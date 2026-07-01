@@ -542,7 +542,7 @@ async def cmd_cart(msg: Message):
 @router.message(Command("webcart"))
 async def cmd_webcart(msg: Message):
     """Visual cart via Telegram WebApp."""
-    url = "https://shopping-bot-webapp.vercel.app/cart.html"
+    url = "https://gewitter89.github.io/resell-radar-ukraine/cart.html"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎨 Открыть корзину", web_app=WebAppInfo(url=url))]
     ])
