@@ -64,12 +64,29 @@ ALL_CATS = FOOD_CATS + HYGIENE_CATS
 KYIV_STORES = {"novus": "482010105", "auchan": "48246401", "metro": "48215610"}
 
 
-async def zakaz_get(client, url, chain):
-    try:
-        r = await client.get(url, headers={**ZAKAZ_HEADERS, "x-chain": chain}, timeout=25)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
+async def zakaz_get(client, url, chain, max_retries=3):
+    """GET with exponential backoff retry."""
+    backoff = 1.0
+    for attempt in range(max_retries):
+        try:
+            r = await client.get(url, headers={**ZAKAZ_HEADERS, "x-chain": chain}, timeout=25)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", backoff * 2))
+                await asyncio.sleep(min(wait, 10))
+                continue
+            if r.status_code >= 500:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+            return None
+        except (httpx.TimeoutException, httpx.ConnectError):
+            await asyncio.sleep(backoff)
+            backoff *= 2
+        except Exception:
+            return None
+    return None
 
 
 async def zakaz_fetch_deals(
@@ -232,16 +249,18 @@ def format_report(promos: list[dict], products: dict[str, list[dict]], city: str
         for product, deals in products.items():
             if deals:
                 best = deals[0]
-                parts.append(
-                    f"<b>{product}</b>\n"
-                    f"  🏪 {best['store']} — <b>{best['price']:.0f} ₴</b>  "
-                    f"<a href='{best['url']}'>открыть</a>"
-                )
-                # Другие магазины
-                others = [d for d in deals[1:4] if d['store'] != best['store']]
+                card = [f"<b>{product}</b>"]
+                if best.get('url'):
+                    card.append(f"  💰 <b>{best['price']:.0f} ₴</b> — {best['store']}  "
+                               f"<a href='{best['url']}'>🛒 купить</a>")
+                else:
+                    card.append(f"  💰 <b>{best['price']:.0f} ₴</b> — {best['store']}")
+                others = [d for d in deals[1:4] if d['store'] != best['store'] and d.get('url')]
                 if others:
-                    other_str = " · ".join(f"{o['store']}: {o['price']:.0f} ₴" for o in others)
-                    parts.append(f"  {other_str}")
+                    for o in others[:3]:
+                        card.append(f"  • {o['store']}: {o['price']:.0f} ₴  "
+                                   f"<a href='{o['url']}'>→</a>")
+                parts.append("\n".join(card))
             else:
                 parts.append(f"  ❌ {product} — не найдено")
 
@@ -285,17 +304,26 @@ async def run_cycle(test: bool = False):
     # 1. Zakaz.ua API — скидки (быстро, без браузера)
     promos = await zakaz_top_promos("all", min_pct=25, limit=15)
 
-    # 2. Поиск продуктов из shopping_list (если есть)
+    # 2. Поиск продуктов из shopping_list (ВСЕ товары + rate-limit safety)
     products = {}
     if not test and shop_list:
-        # Берём первые 5 продуктов для скорости
         flat = []
-        for cat_items in shop_list.values():
-            flat.extend(cat_items[:2])
-        flat = flat[:5]
-
+        for cat_name, cat_items in shop_list.items():
+            for item in cat_items:
+                flat.append(item)
+        # Cap at 20 to avoid hammering Zakaz.ua API
+        flat = flat[:20]
+        errors = 0
         for item in flat:
-            products[item] = await zakaz_search_product(item, limit=5)
+            if errors >= 3:
+                break
+            try:
+                results = await zakaz_search_product(item, limit=3)
+                products[item] = results
+                await asyncio.sleep(0.35)
+            except Exception:
+                errors += 1
+                products[item] = []
     elif test:
         products["молоко 1л"] = await zakaz_search_product("молоко 1л", limit=5)
         products["яйца 10шт"] = await zakaz_search_product("яйца 10шт", limit=5)
@@ -305,24 +333,49 @@ async def run_cycle(test: bool = False):
     return report
 
 
-async def send_telegram(report: str, bot_token: str, chat_id: int) -> bool:
+async def send_telegram(report: str, bot_token: str, chat_id: int, max_retries=3) -> bool:
+    """Send with retry. Falls back to httpx if aiogram unavailable (CI)."""
     if not bot_token:
         print("⚠️ BOT_TOKEN не задан")
         return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    async def _send_chunk(text: str, attempt: int = 0) -> bool:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }, timeout=15)
+                if r.status_code == 200:
+                    return True
+                if r.status_code == 429:
+                    wait = r.json().get("parameters", {}).get("retry_after", 3)
+                    await asyncio.sleep(wait)
+                    if attempt < max_retries:
+                        return await _send_chunk(text, attempt + 1)
+                return False
+        except Exception as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                return await _send_chunk(text, attempt + 1)
+            print(f"❌ Telegram (attempt {attempt+1}): {e}")
+            return False
+
     try:
-        from aiogram import Bot
-        from aiogram.client.default import DefaultBotProperties
-        from aiogram.enums import ParseMode
-        bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        if len(report) <= 4000:
-            await bot.send_message(chat_id=chat_id, text=report)
-        else:
-            for i in range(0, len(report), 3800):
-                prefix = f"📄 Часть {i//3800 + 1}\n\n" if i > 0 else ""
-                await bot.send_message(chat_id=chat_id, text=prefix + report[i:i+3800])
+        chunks = [report] if len(report) <= 4000 else [
+            report[i:i+3800] for i in range(0, len(report), 3800)
+        ]
+        ok = True
+        for i, chunk in enumerate(chunks):
+            prefix = f"📄 Часть {i+1}\n\n" if i > 0 else ""
+            ok = ok and await _send_chunk(prefix + chunk)
+            if i + 1 < len(chunks):
                 await asyncio.sleep(0.5)
-        await bot.session.close()
-        return True
+        return ok
     except Exception as e:
         print(f"❌ Telegram: {e}")
         return False
