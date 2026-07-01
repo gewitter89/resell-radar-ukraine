@@ -25,10 +25,17 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    WebAppInfo, KeyboardButton, ReplyKeyboardMarkup,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+
+try:
+    from aiohttp import web
+    WEBAPP_AVAILABLE = True
+except ImportError:
+    WEBAPP_AVAILABLE = False
 
 import httpx
 
@@ -530,6 +537,29 @@ async def cmd_cart(msg: Message):
                          parse_mode=ParseMode.HTML)
         return
     await show_cart(msg, items)
+
+
+@router.message(Command("webcart"))
+async def cmd_webcart(msg: Message):
+    """Visual cart via Telegram WebApp."""
+    url = "https://shopping-bot-webapp.vercel.app/cart.html"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎨 Открыть корзину", web_app=WebAppInfo(url=url))]
+    ])
+    await msg.answer(
+        "🎨 <b>Визуальная корзина</b>\n\n"
+        "Открой красивую корзину с графиками, кнопками и живыми ценами:",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.message(lambda m: m.web_app_data is not None)
+async def on_webapp_data(msg: Message):
+    """Handle WebApp data (order from visual cart)."""
+    data = msg.web_app_data.data
+    await msg.answer(
+        f"✅ <b>Заказ принят!</b>\n\n{data}\n\n"
+        f"Оформить через команду: /order",
+        parse_mode=ParseMode.HTML)
 
 
 async def show_cart(msg: Message, items: list[tuple[str, float]]):

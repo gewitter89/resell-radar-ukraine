@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Корзина — Shopping Bot</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --card: #16213e;
+  --accent: #0f3460;
+  --gold: #e94560;
+  --green: #4ade80;
+  --red: #ef4444;
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --border: #334155;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 12px;
+  min-height: 100vh;
+}
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 0; margin-bottom: 16px;
+}
+.title { font-size: 22px; font-weight: 700; }
+.badge { background: var(--gold); padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+.cart-item {
+  background: var(--card);
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+}
+.item-top { display: flex; justify-content: space-between; align-items: start; }
+.item-name { font-weight: 600; font-size: 15px; flex: 1; }
+.item-price { font-size: 18px; font-weight: 700; color: var(--green); margin-left: 12px; }
+.item-meta { display: flex; gap: 8px; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.item-meta span { background: var(--accent); padding: 2px 8px; border-radius: 8px; }
+.qty-controls {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.qty-btn {
+  width: 34px; height: 34px; border-radius: 50%;
+  background: var(--accent); border: none; color: white;
+  font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: background 0.2s;
+}
+.qty-btn:active { background: var(--gold); }
+.qty-num { font-size: 18px; font-weight: 700; min-width: 30px; text-align: center; }
+.remove-btn {
+  background: transparent; border: 1px solid var(--red);
+  color: var(--red); padding: 5px 12px; border-radius: 10px;
+  font-size: 12px; cursor: pointer;
+}
+.summary {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: var(--card); padding: 16px 12px 12px;
+  border-top: 1px solid var(--border);
+}
+.summary-row { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+.summary-total { font-size: 20px; font-weight: 700; margin-bottom: 10px; }
+.summary-total b { color: var(--green); }
+.order-btn {
+  width: 100%; background: var(--gold); border: none;
+  color: white; padding: 14px; border-radius: 12px;
+  font-size: 16px; font-weight: 700; cursor: pointer;
+  margin-bottom: 8px;
+}
+.order-btn:active { background: #d63750; }
+.secondary-btn {
+  width: 100%; background: var(--accent); border: none;
+  color: var(--text); padding: 12px; border-radius: 12px;
+  font-size: 14px; cursor: pointer;
+}
+.empty {
+  text-align: center; padding: 60px 12px; color: var(--muted);
+}
+.empty-icon { font-size: 64px; margin-bottom: 16px; }
+.empty-text { font-size: 16px; margin-bottom: 24px; }
+.add-btn {
+  background: var(--gold); border: none; color: white;
+  padding: 12px 24px; border-radius: 12px; font-size: 14px;
+  font-weight: 600;
+}
+.content { padding-bottom: 220px; }
+.store-tag {
+  display: inline-block; background: var(--accent); padding: 2px 8px;
+  border-radius: 8px; font-size: 11px; margin-right: 4px;
+}
+.free-delivery { color: var(--green); font-size: 12px; font-weight: 600; }
+.delivery-warning { color: #fbbf24; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="title">🛒 Корзина</div>
+  <div class="badge" id="count-badge">0 товаров</div>
+</div>
+<div class="content" id="cart-container"></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.expand();
+tg?.ready();
+
+let cart = [];
+
+async function fetchCart() {
+  try {
+    const initData = tg?.initData || '';
+    const resp = await fetch('/api/cart?init=' + encodeURIComponent(initData));
+    if (resp.ok) {
+      cart = await resp.json();
+      render();
+    } else {
+      renderEmpty();
+    }
+  } catch (e) {
+    renderDemo();
+  }
+}
+
+function renderDemo() {
+  cart = [
+    {product: "Молоко 1л", qty: 2, price: 35, store: "Zakaz.ua", url: "#"},
+    {product: "Яйца 10шт", qty: 1, price: 45, store: "Zakaz.ua", url: "#"},
+    {product: "Куриное филе 1кг", qty: 1, price: 185, store: "Zakaz.ua", url: "#"},
+    {product: "Макароны 500г", qty: 2, price: 28, store: "Zakaz.ua", url: "#"},
+  ];
+  render();
+}
+
+function render() {
+  const c = document.getElementById('cart-container');
+  const badge = document.getElementById('count-badge');
+  if (!cart || cart.length === 0) { renderEmpty(); return; }
+  badge.textContent = cart.length + ' товаров';
+
+  const total = cart.reduce((s, i) => s + i.price * i.qty, 0);
+  const stores = [...new Set(cart.map(i => i.store))];
+  const freeFrom = 1200;
+  const isFree = total >= freeFrom;
+  const deliveryCost = isFree ? 0 : 59;
+  const neededFree = freeFrom - total;
+
+  let html = '';
+  for (const item of cart) {
+    const sub = item.price * item.qty;
+    html += `<div class="cart-item">
+      <div class="item-top">
+        <div class="item-name">${item.product}</div>
+        <div class="item-price">${sub.toFixed(0)} ₴</div>
+      </div>
+      <div class="item-meta">
+        <span class="store-tag">${item.store}</span>
+        <span>${item.price.toFixed(0)} ₴/шт</span>
+      </div>
+      <div class="qty-controls">
+        <button class="qty-btn" onclick="changeQty('${item.product}', -1)">−</button>
+        <div class="qty-num">${item.qty}</div>
+        <button class="qty-btn" onclick="changeQty('${item.product}', 1)">+</button>
+        <button class="remove-btn" onclick="removeItem('${item.product}')">🗑 Убрать</button>
+      </div>
+    </div>`;
+  }
+
+  html += `<div style="background: var(--card); border-radius: 14px; padding: 14px; margin-top: 16px; border: 1px solid var(--border)">
+    <div style="font-weight: 700; margin-bottom: 10px; font-size: 15px">📦 Доставка</div>
+    <div class="summary-row">
+      <span>🚚 ${stores[0] || 'Магазин'}</span>
+      <span>${isFree ? '<span class="free-delivery">БЕСПЛАТНО</span>' : deliveryCost + ' ₴'}</span>
+    </div>
+    ${!isFree ? `<div class="delivery-warning">До бесплатной: +${neededFree.toFixed(0)} ₴</div>` : ''}
+    <div style="margin-top: 4px; font-size: 11px; color: var(--muted)">Бесплатно от ${freeFrom} ₴</div>
+  </div>`;
+
+  html += `<div style="background: var(--card); border-radius: 14px; padding: 14px; margin-top: 10px; border: 1px solid var(--gold)">
+    <div class="summary-total">Итого: <b>${(total + deliveryCost).toFixed(0)} ₴</b></div>
+    <button class="order-btn" onclick="order()">📦 Оформить заказ</button>
+    <button class="secondary-btn" onclick="clearCart()">🗑 Очистить корзину</button>
+  </div>`;
+
+  c.innerHTML = html;
+}
+
+function renderEmpty() {
+  const c = document.getElementById('cart-container');
+  document.getElementById('count-badge').textContent = '0 товаров';
+  c.innerHTML = `<div class="empty">
+    <div class="empty-icon">🛒</div>
+    <div class="empty-text">Корзина пуста</div>
+    <button class="add-btn" onclick="tg.close()">Найти товары</button>
+  </div>`;
+}
+
+function changeQty(product, delta) {
+  const item = cart.find(i => i.product === product);
+  if (!item) return;
+  item.qty = Math.max(1, item.qty + delta);
+  render();
+}
+
+function removeItem(product) {
+  cart = cart.filter(i => i.product !== product);
+  render();
+}
+
+function clearCart() {
+  if (confirm('Очистить корзину?')) {
+    cart = [];
+    render();
+  }
+}
+
+function order() {
+  if (!cart.length) return;
+  const total = cart.reduce((s, i) => s + i.price * i.qty, 0);
+  const msg = `📦 Заказ ${cart.length} товаров на ${total.toFixed(0)} ₴\n` +
+    cart.map(i => `  • ${i.product} × ${i.qty} = ${(i.price * i.qty).toFixed(0)} ₴`).join('\n');
+  tg?.sendData(msg);
+  alert('Заказ отправлен в бота!');
+}
+
+fetchCart();
+</script>
+</body>
+</html>
