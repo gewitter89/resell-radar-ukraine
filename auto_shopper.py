@@ -125,7 +125,138 @@ async def zakaz_fetch_deals(
     return deals
 
 
+import httpx
+from datetime import datetime, timedelta
+import re
+
+
+# ====================================================================
+# УМНЫЙ ФИЛЬТР (алгоритмический, без AI API)
+# ====================================================================
+
+def extract_weight(text: str) -> tuple[float, str] | None:
+    """Извлекает вес/объем из строки. Возвращает (value_in_grams, unit)."""
+    text = text.lower().replace(",", ".").replace(" ", "")
+    patterns = [
+        (r'(\d+\.?\d*)\s*(кг|kg)', lambda m: (float(m.group(1)) * 1000, 'g')),
+        (r'(\d+\.?\d*)\s*(г|g|gr)\b', lambda m: (float(m.group(1)), 'g')),
+        (r'(\d+\.?\d*)\s*(л|l|ltr)\b', lambda m: (float(m.group(1)) * 1000, 'ml')),
+        (r'(\d+\.?\d*)\s*(мл|ml)\b', lambda m: (float(m.group(1)), 'ml')),
+        (r'(\d+\.?\d*)\s*(шт|pc)', lambda m: (float(m.group(1)), 'pcs')),
+        (r'(\d+\.?\d*)\s*(уп|pack)', lambda m: (float(m.group(1)), 'pcs')),
+    ]
+    for pattern, converter in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return converter(match)
+    return None
+
+
+def smart_filter(query: str, deals: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Фильтрует мусор из поиска.
+    Возвращает (отфильтрованные результаты, причины отсева).
+    """
+    if not deals:
+        return [], [f"'{query}': поиск пустой"]
+
+    query_lower = query.lower()
+    target_weight = extract_weight(query)
+    filtered = []
+    rejected = []
+
+    # Ключевые слова для проверки соответствия
+    query_keywords = set(re.findall(r'[а-яё]+', query_lower))
+
+    # Blacklist: слова-маркеры мусора
+    blacklist_map = {
+        'індейк': ['корм', 'korm', 'pate', 'паштет'],
+        'індич': ['корм', 'korm', 'pate', 'паштет', 'volohyi', 'вологий'],
+        'курк': ['корм', 'korm', 'pate', 'паштет'],
+        'куряч': ['корм', 'korm', 'pate', 'паштет'],
+        'батон': ['батончик', 'snack', 'снек', 'шоколад'],
+        'хліб': ['хлібці', 'сухарі', 'хруст', 'crisp'],
+        'сир': ['плавлен', 'spread', 'spred'],
+        'молоко': ['йогурт', 'кефір', 'ряжан'],
+        'банани': ['сухофрукт', 'сушений', 'dried', 'чіпси'],
+        'масло': ['печиво', 'суміш', 'маргарин'],
+    }
+
+    for deal in deals:
+        title_lower = deal.get('title', '').lower()
+        reason = None
+
+        # 1. Проверяем что ключевые слова запроса есть в title
+        title_words = set(re.findall(r'[а-яё]+', title_lower))
+        overlap = query_keywords & title_words
+        if not overlap and len(query_keywords) > 0:
+            reason = f"нет ключевых слов ({query_keywords})"
+
+        # 2. Проверяем по blacklist
+        if not reason:
+            for qword, bad_words in blacklist_map.items():
+                if qword in query_lower:
+                    for bad in bad_words:
+                        if bad in title_lower:
+                            reason = f"blacklist: '{bad}' не подходит для '{qword}'"
+                            break
+                    if reason:
+                        break
+
+        # 3. Проверяем вес
+        if not reason and target_weight:
+            deal_weight = extract_weight(deal.get('title', ''))
+            if deal_weight:
+                target_val, target_unit = target_weight
+                deal_val, deal_unit = deal_weight
+                # Допускаем отклонение ±50%
+                if deal_val < target_val * 0.5:
+                    reason = f"вес {deal_val} < {target_val}*0.5"
+                elif deal_val > target_val * 3.0:
+                    reason = f"вес {deal_val} > {target_val}*3"
+
+        # 4. Sanity check: цена за "1кг картошки" не должна быть 339₴
+        if not reason:
+            price = deal.get('price', 0)
+            if target_weight and target_weight[1] in ('g', 'ml'):
+                target_val = target_weight[0]
+                deal_w = extract_weight(deal.get('title', ''))
+                if deal_w and deal_w[0] > 0:
+                    price_per_kg = price / deal_w[0] * 1000
+                    # Если цена за кг > 500₴ для базовых продуктов (картошка, лук, хлеб) — подозрительно
+                    if any(w in query_lower for w in ['картоф', 'лук', 'хлеб', 'морков', 'свекл']):
+                        if price_per_kg > 300:
+                            reason = f"price/kg={price_per_kg:.0f}₴ слишком высокая"
+
+        if reason:
+            rejected.append(f"'{deal.get('title')[:40]}' — {reason}")
+        else:
+            filtered.append(deal)
+
+    return filtered, rejected
+
+
+QUERY_SYNONYMS = {
+    "филе индейки": ["філе індички", "індичка філе", "індичка"],
+    "батон": ["батон нарізний", "батон білий"],
+    "хлеб белый": ["хліб білий", "хліб пшеничний нарізний"],
+    "хлеб черный": ["хліб житній", "хліб чорний", "бородинський хліб"],
+    "картофель 2кг": ["картопля 2кг", "картопля"],
+    "лук 1кг": ["цибуля ріпчаста", "цибуля"],
+    "помидоры 1кг": ["томати 1кг", "помідори"],
+    "огурцы 1кг": ["огірки", "огірок"],
+    "бананы 1кг": ["банани"],
+    "куриное филе 1кг": ["куряче філе"],
+    "куриные бедра": ["стегно куряче", "курячі стегна"],
+    "сосиски молочные": ["сосиски молочні"],
+    "молоко 1л": ["молоко"],
+    "сыр твердый 200г": ["сир твердий", "сир"],
+    "фарш свиной 500г": ["фарш свинячий", "свинячий фарш"],
+}
+
+
 async def zakaz_search_product(query: str, min_pct: int = 0, limit: int = 15) -> list[dict]:
+
     """Поиск конкретного продукта через Zakaz.ua API."""
     deals = []
     async with httpx.AsyncClient() as client:
@@ -152,7 +283,56 @@ async def zakaz_search_product(query: str, min_pct: int = 0, limit: int = 15) ->
         if key not in seen or d["price"] < seen[key]["price"]:
             seen[key] = d
 
-    return sorted(seen.values(), key=lambda x: x["price"])[:limit]
+    raw_results = sorted(seen.values(), key=lambda x: x["price"])[:limit]
+
+    # Применяем умный фильтр
+    filtered, rejected = smart_filter(query, raw_results)
+    if rejected:
+        print(f"🗑️ {query}: {len(rejected)} отсеяно ({', '.join(rejected[:2])})")
+
+    # Если фильтр дал хоть что-то — возвращаем отфильтрованное
+    if filtered:
+        return filtered
+
+    # Если пусто — пробуем синонимы (RU → UA)
+    if query in QUERY_SYNONYMS:
+        for synonym in QUERY_SYNONYMS[query]:
+            print(f"🔄 {query} → synonym: {synonym}")
+            syn_deals = []
+            async with httpx.AsyncClient() as client:
+                for chain, sid in KYIV_STORES.items():
+                    url = f"{ZAKAZ_BASE}/stores/{sid}/products/search/?q={synonym}"
+                    data = await zakaz_get(client, url, chain)
+                    if data and data.get("results"):
+                        for p in data["results"]:
+                            syn_deals.append({
+                                "store": chain.capitalize(),
+                                "chain": chain,
+                                "title": p.get("title", "").strip(),
+                                "price": round(p.get("price", 0) / 100, 2),
+                                "discount_pct": 0,
+                                "url": p.get("web_url", ""),
+                                "category": "search",
+                            })
+            # Фильтруем синоним-результаты (используем UA query!)
+            syn_filtered, _ = smart_filter(synonym, syn_deals)
+            if syn_filtered:
+                print(f"✅ {query} → {synonym}: {len(syn_filtered)} найдено")
+                return sorted(syn_filtered, key=lambda x: x["price"])[:limit]
+
+    # Fallback: возвращаем сырые данные только если все выглядят нормально
+
+    # (т.е. в title есть хоть одно слово из запроса)
+    safe_raw = [d for d in raw_results[:3]
+                if any(w in d.get("title", "").lower() for w in re.findall(r'[а-яё]+', query.lower()) if len(w) > 3)]
+
+    if safe_raw:
+        print(f"⚠️ {query}: фильтр пустой, возвращаю {len(safe_raw)} похожих")
+        return safe_raw
+
+    # Иначе — пусто, будет ❌ в отчете
+    print(f"❌ {query}: ничего релевантного")
+    return []
 
 
 async def zakaz_top_promos(group: str = "all", min_pct: int = 30, limit: int = 20) -> list[dict]:
